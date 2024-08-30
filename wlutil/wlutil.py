@@ -6,8 +6,6 @@ import random
 import string
 import sys
 import collections
-import shutil
-import psutil
 import errno
 import pathlib
 import git
@@ -20,9 +18,30 @@ import re
 import pprint
 import doit
 import importlib.util
+import psutil
+import signal
+
+cleanUpFunctions = []
+
+
+# Register clean-up function for jobs launched by launch.py
+def registerCleanUp(func):
+    cleanUpFunctions.append(func)
+
+
+# Handle SIGINT
+def sigIntHandler(signum, frame):
+    for cleanUpFunc in cleanUpFunctions:
+        cleanUpFunc()
+
+    sys.exit("Received SIGINT")
+
+
+# Register SIGINT signal handler
+signal.signal(signal.SIGINT, sigIntHandler)
 
 # Useful for defining lists of files (e.g. 'files' part of config)
-FileSpec = collections.namedtuple('FileSpec', [ 'src', 'dst' ])
+FileSpec = collections.namedtuple('FileSpec', ['src', 'dst'])
 
 # Global configuration (marshalCtx set by initialize())
 ctx = None
@@ -30,12 +49,12 @@ ctx = None
 # List of marshal submodules (those enabled by init-submodules.sh)
 marshalSubmods = [
         'linux-dir',
-        'bbl-dir',
         'opensbi-dir',
         'busybox-dir',
         'buildroot-dir',
         'driver-dirs'
         ]
+
 
 class SubmoduleError(Exception):
     """Error representing a nonexistent or uninitialized submodule"""
@@ -46,13 +65,14 @@ class SubmoduleError(Exception):
         return 'Submodule Error: ' + self.__str__()
 
     def __str__(self):
-        if self.path in [ ctx[opt] for opt in marshalSubmods ]:
+        if self.path in [ctx[opt] for opt in marshalSubmods]:
             return 'Marshal submodule "' + str(self.path) + \
                     '" not initialized. Please run "./init-submodules.sh."'
         else:
             return "Dependency missing or not initialized " + \
                     str(self.path) + \
                     ". Do you need to initialize a submodule?"
+
 
 class RootfsCapacityError(Exception):
     """Error representing that the workload's rootfs has run out of disk space."""
@@ -65,6 +85,7 @@ class RootfsCapacityError(Exception):
                 "\tRequested: " + humanfriendly.format_size(self.requested) + \
                 "\tAvailable: " + humanfriendly.format_size(self.available)
 
+
 class ConfigurationError(Exception):
     """Error representing a generic problem with configuration"""
     def __init__(self, cause):
@@ -72,6 +93,7 @@ class ConfigurationError(Exception):
 
     def __str__(self):
         return "Configuration Error: " + self.cause
+
 
 class ConfigurationOptionError(ConfigurationError):
     """Error representing a problem with marshal configuration."""
@@ -81,6 +103,7 @@ class ConfigurationOptionError(ConfigurationError):
 
     def __str__(self):
         return "Error with configuration option '" + self.opt + "': " + str(self.cause)
+
 
 class ConfigurationFileError(ConfigurationError):
     """Error representing issues with loading the configuration"""
@@ -99,35 +122,38 @@ def cleanPaths(opts, baseDir=pathlib.Path('.')):
     relative to baseDir."""
 
     # These options represent pathlib paths
+    # (path, needsStrict)
+    # mount-dir will be created by marshal, so this path may not exist
     pathOpts = [
-        'board-dir',
-        'image-dir',
-        'linux-dir',
-        'firesim-dir',
-        'bbl-dir',
-        'opensbi-dir',
-        'log-dir',
-        'res-dir',
-        'workload-dirs'
+        ('board-dir', True),
+        ('image-dir', True),
+        ('linux-dir', True),
+        ('firesim-dir', True),
+        ('opensbi-dir', True),
+        ('log-dir', True),
+        ('res-dir', True),
+        ('mount-dir', False),
+        ('workload-dirs', True)
     ]
 
-    def clean(path):
-        return (baseDir / pathlib.Path(path)).resolve(strict=True)
+    def clean(path, needsStrict):
+        return (baseDir / pathlib.Path(path)).resolve(strict=needsStrict)
 
-    for opt in pathOpts:
+    for (opt, needsStrict) in pathOpts:
         if opt in opts and opts[opt] is not None:
             try:
                 if isinstance(opts[opt], str):
                     # Scalar path
-                    opts[opt] = clean(opts[opt])
+                    opts[opt] = clean(opts[opt], needsStrict)
                 else:
                     # List of paths
                     cleanedPaths = []
                     for p in opts[opt]:
-                        cleanedPaths.append(clean(p))
+                        cleanedPaths.append(clean(p, needsStrict))
                     opts[opt] = cleanedPaths
             except Exception as e:
                 raise ConfigurationOptionError(opt, "Invalid path: " + str(e))
+
 
 # These represent all available user-defined options (those set by the
 # environment or config files). See default-config.yaml or the documentation
@@ -138,10 +164,11 @@ userOpts = [
         'image-dir',
         'firesim-dir',
         'log-dir',
+        'mount-dir',
         'res-dir',
         'jlevel',  # int or str from user, converted to '-jN' after loading
-        'rootfs-margin', # int or str from user, converted to int bytes after loading
-        'doitOpts', # Dictionary of options to pass to doit (for the 'run' section)
+        'rootfs-margin',  # int or str from user, converted to int bytes after loading
+        'doitOpts',  # Dictionary of options to pass to doit (for the 'run' section)
         ]
 
 # These represent all available derived options (constants and those generated
@@ -165,9 +192,6 @@ derivedOpts = [
         # Storage for generated/temporary outputs
         'gen-dir',
 
-        # Empty directory used for mounting images
-        'mnt-dir',
-
         # Path to basic template for user-specified commands (the "command:" option)
         'command-script',
 
@@ -180,9 +204,6 @@ derivedOpts = [
         # Linux source to use by default (can be overwritten by user config). Derived from board-dir.
         'linux-dir',
 
-        # Default pk/bbl source to use by default (can be overwritten by user config). Derived from board-dir.
-        'bbl-dir',
-
         # Default OpenSBI source to use by default (can be overwritten by user config). Derived from board-dir.
         'opensbi-dir',
 
@@ -193,7 +214,8 @@ derivedOpts = [
         'linux-make-args'
         ]
 
-class marshalCtx(collections.MutableMapping):
+
+class marshalCtx(collections.abc.MutableMapping):
     """Global FireMarshal context (configuration)."""
 
     # Actual internal storage for all options
@@ -277,9 +299,9 @@ class marshalCtx(collections.MutableMapping):
         For example MARSHAL_LINUX_DIR=../special/linux would add a ('linux-dir'
         : '../special/linux') option to the config."""
 
-        reOpt = re.compile("^MARSHAL_(\S+)")
+        reOpt = re.compile(r"^MARSHAL_(\S+)")
         envCfg = {}
-        for opt,val in os.environ.items():
+        for opt, val in os.environ.items():
             match = reOpt.match(opt)
             if match:
                 optName = match.group(1).lower().replace('_', '-')
@@ -288,17 +310,15 @@ class marshalCtx(collections.MutableMapping):
         cleanPaths(envCfg)
         self.add(envCfg)
 
-
     def importDistro(self, distroPath):
         spec = importlib.util.spec_from_file_location(distroPath.stem, distroPath / "__init__.py",
-                submodule_search_locations=[self['wlutil-dir'], str(distroPath)])
+                                                      submodule_search_locations=[self['wlutil-dir'], str(distroPath)])
 
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
 
         return module
-
 
     def deriveOpts(self):
         """Update or initialize all derived options. This assumes all
@@ -309,14 +329,11 @@ class marshalCtx(collections.MutableMapping):
         self['busybox-dir'] = self['wlutil-dir'] / 'busybox'
         self['initramfs-dir'] = self['wlutil-dir'] / "initramfs"
         self['gen-dir'] = self['wlutil-dir'] / "generated"
-        self['mnt-dir'] = self['root-dir'] / "disk-mount"
         self['command-script'] = self['gen-dir'] / "_command.sh"
         self['run-name'] = ""
         self['rootfs-margin'] = humanfriendly.parse_size(str(self['rootfs-margin']))
-        self['jlevel'] = '-j' + str(self['jlevel'])
 
         self['driver-dirs'] = list(self['board-dir'].glob('drivers/*'))
-        self['bbl-dir'] = self['board-dir'] / 'firmware' / 'riscv-pk'
         self['opensbi-dir'] = self['board-dir'] / 'firmware' / 'opensbi'
         self['linux-dir'] = self['board-dir'] / 'linux'
         self['installers'] = self['board-dir'] / 'installers'
@@ -332,6 +349,13 @@ class marshalCtx(collections.MutableMapping):
             m = self.importDistro(dPath)
             self['distro-mods'][m.__name__] = m
 
+        if self['jlevel'] is None:
+            self['jlevel'] = psutil.cpu_count()
+            if self['jlevel'] is None:
+                # logging has not be initialized by this point, have to settle
+                # for print
+                print("WARNING: unable to determine CPU count, defaulting jlevel to 1. You may explicitly set the jlevel in your marshal-config.yaml.")
+                self['jlevel'] = 1
 
     def setRunName(self, configPath, operation):
         """Helper function for formatting a  unique run name. You are free to
@@ -350,10 +374,7 @@ class marshalCtx(collections.MutableMapping):
         timeline = time.strftime("%Y-%m-%d--%H-%M-%S", time.gmtime())
         randname = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(16))
 
-        runName = configName + \
-                "-" + operation + \
-                "-" + timeline + \
-                "-" +  randname
+        runName = f"{configName}-{operation}-{timeline}-{randname}"
 
         self['run-name'] = runName
 
@@ -382,6 +403,7 @@ class marshalCtx(collections.MutableMapping):
     def __repr__(self):
         return repr(self.opts)
 
+
 def initialize():
     """Get wlutil ready to use. Must be called at least once per installation.
     Is safe and fast to call every time you load the library."""
@@ -389,7 +411,7 @@ def initialize():
     global ctx
     ctx = marshalCtx()
 
-    ctx['mnt-dir'].mkdir(parents=True, exist_ok=True)
+    ctx['mount-dir'].mkdir(parents=True, exist_ok=True)
 
     # Directories that must be initialized for disk-based initramfs
     initramfs_disk_dirs = ["bin", 'dev', 'etc', 'proc', 'root', 'sbin', 'sys', 'usr/bin', 'usr/sbin', 'mnt/root']
@@ -398,6 +420,9 @@ def initialize():
     for d in initramfs_disk_dirs:
         if not (ctx['initramfs-dir'] / 'disk' / d).exists():
             (ctx['initramfs-dir'] / 'disk' / d).mkdir(parents=True)
+        if not (ctx['initramfs-dir'] / 'nodisk' / d).exists():
+            (ctx['initramfs-dir'] / 'nodisk' / d).mkdir(parents=True)
+
 
 def getCtx():
     """Return the global confguration object (ctx). This is only valid after
@@ -406,6 +431,7 @@ def getCtx():
     Returns (marshalCtx)
     """
     return ctx
+
 
 def getOpt(opt):
     if ctx is None:
@@ -431,6 +457,8 @@ class consoleFormatter(logging.Formatter):
 
 fileHandler = None
 consoleHandler = None
+
+
 def initLogging(verbose, logPath=None, werr=False):
     """logging setup: You can call this multiple times to reset logging (e.g. if you
        change the RunName). If 'logPath' is set, that path will be used.
@@ -440,7 +468,7 @@ def initLogging(verbose, logPath=None, werr=False):
     global consoleHandler
 
     rootLogger = logging.getLogger()
-    rootLogger.setLevel(logging.NOTSET) # capture everything
+    rootLogger.setLevel(logging.NOTSET)  # capture everything
 
     if werr:
         rootLogger.addFilter(WErrFilt)
@@ -456,7 +484,7 @@ def initLogging(verbose, logPath=None, werr=False):
     fileHandler = logging.FileHandler(str(logPath))
     fileLogFormatter = logging.Formatter("%(asctime)s [%(funcName)-12.12s] [%(levelname)-5.5s]  %(message)s")
     fileHandler.setFormatter(fileLogFormatter)
-    fileHandler.setLevel(logging.NOTSET) # log everything to file
+    fileHandler.setLevel(logging.NOTSET)  # log everything to file
     rootLogger.addHandler(fileHandler)
 
     # log to stdout, without special formatting
@@ -466,17 +494,18 @@ def initLogging(verbose, logPath=None, werr=False):
     consoleHandler = logging.StreamHandler(stream=sys.stdout)
     consoleHandler.setFormatter(consoleFormatter())
     if verbose:
-        consoleHandler.setLevel(logging.NOTSET) # show everything
+        consoleHandler.setLevel(logging.NOTSET)  # show everything
     else:
-        consoleHandler.setLevel(logging.INFO) # show only INFO and greater in console
+        consoleHandler.setLevel(logging.INFO)  # show only INFO and greater in console
 
     rootLogger.addHandler(consoleHandler)
 
-# Run subcommands and handle logging etc.
-# The arguments are identical to those for subprocess.call()
-# level - The logging level to use
-# check - Throw an error on non-zero return status
+
 def run(*args, level=logging.DEBUG, check=True, **kwargs):
+    """Run subcommands and handle logging etc. The arguments are identical to those for subprocess.call().
+        level - The logging level to use
+        check - Throw an error on non-zero return status"""
+
     log = logging.getLogger()
 
     if isinstance(args[0], str):
@@ -494,10 +523,29 @@ def run(*args, level=logging.DEBUG, check=True, **kwargs):
         log.log(level, line.strip())
     p.wait()
 
-    if check == True and p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, prettyCmd)
+    if check and p.returncode != 0:
+        raise sp.CalledProcessError(p.returncode, prettyCmd)
 
     return p
+
+
+def run_with_retries(command, level=logging.DEBUG, num_attempts=3, polling_interval_s=1.0):
+    """ Repeatedly tries to run a command, initially tolerating failure
+        num_attempts -> The maximum number of invocations of the command
+        polling_interval_s -> The time, in seconds, between invocations """
+
+    attempt_count = 1
+    while attempt_count <= num_attempts:
+        # Permit run to throw an exception only on the final invocation
+        check_on_last_attempt = (attempt_count == num_attempts)
+        if run(command, level, check=check_on_last_attempt).returncode == 0:
+            break
+
+        log = logging.getLogger()
+        log.log(level, "Retrying last command...")
+        time.sleep(polling_interval_s)
+        attempt_count += 1
+
 
 def genRunScript(command):
     with open(getOpt('command-script'), 'w') as s:
@@ -507,8 +555,9 @@ def genRunScript(command):
 
     return getOpt('command-script')
 
-# This is like os.waitpid, but it works for non-child processes
+
 def waitpid(pid):
+    """This is like os.waitpid, but it works for non-child processes"""
     done = False
     while not done:
         try:
@@ -519,42 +568,94 @@ def waitpid(pid):
                 break
         time.sleep(0.25)
 
-if sp.run(['/usr/bin/sudo', '-ln', 'true'], stdout=sp.DEVNULL).returncode == 0:
-    # User has passwordless sudo available, use the mount command (much faster)
-    sudoCmd = ["/usr/bin/sudo"]
-    @contextmanager
-    def mountImg(imgPath, mntPath):
-        run(sudoCmd + ["mount", "-o", "loop", imgPath, mntPath])
-        try:
-            yield mntPath
-        finally:
-            run(sudoCmd + ['umount', mntPath])
-else:
-    # User doesn't have sudo (use guestmount, slow but reliable)
-    sudoCmd = []
-    @contextmanager
-    def mountImg(imgPath, mntPath):
-        run(['guestmount', '--pid-file', 'guestmount.pid', '-a', imgPath, '-m', '/dev/sda', mntPath])
-        try:
-            with open('./guestmount.pid', 'r') as pidFile:
-                mntPid = int(pidFile.readline())
-            yield mntPath
-        finally:
-            run(['guestunmount', mntPath])
-            os.remove('./guestmount.pid')
 
-        # There is a race-condition in guestmount where a background task keeps
-        # modifying the image for a period after unmount. This is the documented
-        # best-practice (see man guestmount).
-        waitpid(mntPid)
+sudoCmd = ["/usr/bin/sudo"]
+pwdlessSudoCmd = []  # set if pwdless sudo is enabled
+
+
+def runnableWithSudo(cmd):
+    global sudoCmd
+    return sp.run(sudoCmd + ['-ln', cmd], stderr=sp.DEVNULL, stdout=sp.DEVNULL).returncode == 0
+
+
+if runnableWithSudo('true'):
+    # User has passwordless sudo available
+    pwdlessSudoCmd = sudoCmd
+
+
+def existsAndRunnableWithSudo(cmd):
+    global sudoCmd
+    return os.path.exists(cmd) and runnableWithSudo(cmd)
+
+
+@contextmanager
+def mountImg(imgPath, mntPath):
+    global sudoCmd
+    global pwdlessSudoCmd
+
+    assert imgPath.is_file(), f"Unable to find {imgPath} to mount"
+    ret = run(["mountpoint", mntPath], check=False).returncode
+    # mountpoint on Ubuntu 20.* returns 1 (on 22.* it returns 32) for an empty folder
+    assert ret == 1 or ret == 32, f"{mntPath} already mounted. Somethings wrong"
+
+    uid = sp.run(['id', '-u'], capture_output=True, text=True).stdout.strip()
+    gid = sp.run(['id', '-g'], capture_output=True, text=True).stdout.strip()
+
+    if pwdlessSudoCmd:
+        # use faster mount without firesim script since we have pwdless sudo
+        run(pwdlessSudoCmd + ["mount", "-o", "loop", imgPath, mntPath])
+        run(pwdlessSudoCmd + ["chown", "-R", f"{uid}:{gid}", mntPath])
+        try:
+            yield mntPath
+        finally:
+            run_with_retries(pwdlessSudoCmd + ['umount', mntPath])
+    else:
+        # use either firesim-*mount* cmds if available/useable or default to guestmount (slower but reliable)
+        fsimMountCmd = '/usr/local/bin/firesim-mount-with-uid-gid'
+        fsimUnmountCmd = '/usr/local/bin/firesim-unmount'
+
+        if existsAndRunnableWithSudo(fsimMountCmd) and existsAndRunnableWithSudo(fsimUnmountCmd):
+            run(sudoCmd + [fsimMountCmd, imgPath, mntPath, uid, gid])
+            try:
+                yield mntPath
+            finally:
+                run_with_retries(sudoCmd + [fsimUnmountCmd, mntPath])
+        else:
+            # guestmount does not support NFS filesystems
+            fstype = sp.run(["df", mntPath, "--output=fstype"], capture_output=True, text=True).stdout.strip().splitlines()[-1]
+            assert "nfs" not in fstype, f"Guestmount does not support {fstype} filesystems, change mount-dir to a non-NFS filesystem"
+
+            pidPath = './guestmount.pid'
+            run(['guestmount', '--pid-file', pidPath, '-o', f'uid={uid}', '-o', f'gid={gid}', '-a', imgPath, '-m', '/dev/sda', mntPath])
+            try:
+                with open(pidPath, 'r') as pidFile:
+                    mntPid = int(pidFile.readline())
+                yield mntPath
+            finally:
+                run(['guestunmount', mntPath])
+                os.remove(pidPath)
+
+            # There is a race-condition in guestmount where a background task keeps
+            # modifying the image for a period after unmount. This is the documented
+            # best-practice (see man guestmount).
+            waitpid(mntPid)
+
 
 def toCpio(src, dst):
+    global sudoCmd
+    global pwdlessSudoCmd
+
     log = logging.getLogger()
     log.debug("Creating Cpio archive from " + str(src))
-    with open(dst, 'wb') as outCpio:
-        p = sp.run(sudoCmd + ["sh", "-c", "find -print0 | cpio --owner root:root --null -ov --format=newc"],
-                stderr=sp.PIPE, stdout=outCpio, cwd=src)
-        log.debug(p.stderr.decode('utf-8'))
+
+    fsimCpioCmd = '/usr/local/bin/firesim-cpio'
+    if existsAndRunnableWithSudo(fsimCpioCmd):
+        run(sudoCmd + [fsimCpioCmd, src, dst])
+    else:
+        with open(dst, 'wb') as outCpio:
+            p = sp.run(pwdlessSudoCmd + ["sh", "-c", "find -print0 | cpio --owner root:root --null -ov --format=newc"],
+                       stderr=sp.PIPE, stdout=outCpio, cwd=src)
+            log.debug(p.stderr.decode('utf-8'))
 
 
 def resizeFS(img, newSize=0):
@@ -577,9 +678,9 @@ def resizeFS(img, newSize=0):
 
     origSz = os.path.getsize(img)
     if origSz > newSize:
-        log.warn("Cannot shrink image file " + str(img) + \
-                ": current size=" + humanfriendly.format_size(origSz, binary=True) + \
-                " requested size=" + humanfriendly.format_size(newSize, binary=True))
+        log.warn("Cannot shrink image file " + str(img) +
+                 ": current size=" + humanfriendly.format_size(origSz, binary=True) +
+                 " requested size=" + humanfriendly.format_size(newSize, binary=True))
         return
     elif origSz == newSize:
         return
@@ -597,18 +698,49 @@ def copyImgFiles(img, files, direction):
     direction - "in" or "out" for copying files into or out of the image (respectively)
     """
     log = logging.getLogger()
-
-    with mountImg(img, getOpt('mnt-dir')):
+    assert direction in ['in', 'out'], f"direction={direction} must be either 'in' or 'out'"
+    with mountImg(img, getOpt('mount-dir')):
         for f in files:
-            if direction == 'in':
-                dst = str(getOpt('mnt-dir') / f.dst.relative_to('/'))
-                run(sudoCmd + ['cp', '-a', str(f.src), dst])
-            elif direction == 'out':
-                uid = os.getuid()
-                src = str(getOpt('mnt-dir') / f.src.relative_to('/'))
-                run(sudoCmd + ['cp', '-a', src, str(f.dst)])
-            else:
-                raise ValueError("direction option must be either 'in' or 'out'")
+            cpSrcMaybeRelPath = f.src if direction == 'in' else f.src.relative_to('/')
+            cpDstMaybeRelPath = f.dst.relative_to('/') if direction == 'in' else f.dst
+            cpSrcResPath = cpSrcMaybeRelPath if direction == 'in' else getOpt('mount-dir') / cpSrcMaybeRelPath
+            cpDstResPath = getOpt('mount-dir') / cpDstMaybeRelPath if direction == 'in' else cpDstMaybeRelPath
+
+            # modify perms for dirs to always be able to copy in/out
+            oldPerms = {}  # store old permissions
+            relaxedPerms = 0o777  # arb. chosen to be very permissive
+            dirsToModify = []
+
+            # irrespective if the mountpoint is src/dst, modify all dirs up to mountpoint (including the src/dst dir)
+            withinMountRelPath = cpDstMaybeRelPath if direction == 'in' else cpSrcMaybeRelPath
+            withinMountPath = getOpt('mount-dir') / withinMountRelPath
+            parents = withinMountRelPath.parents if withinMountRelPath.parents else '.'
+            dirsToModify.extend([getOpt('mount-dir') / e for e in reversed(parents)])
+            dirsToModify.extend([withinMountPath] if withinMountPath.is_dir() else [])
+            # also ensure that if copying a directory into a mountpoint, that directory can be written in the mountpoint
+            dirsToModify.extend([cpDstResPath / cpSrcResPath.name] if direction == 'in' and cpSrcResPath.is_dir() else [])
+
+            # remove duplicates but keep order
+            dirsToModify = list(dict.fromkeys(dirsToModify))
+
+            for dirPath in dirsToModify:
+                perms = int(oct(os.stat(dirPath).st_mode)[-3:], 8)
+                log.debug(f"Changing permissions of {dirPath} from {oct(perms)}:{type(perms)} to {oct(relaxedPerms)} temporarily")
+                assert dirPath not in oldPerms, f"Something went wrong. Expected that {dirPath}'s permissions aren't already set"
+                oldPerms[dirPath] = perms
+                os.chmod(dirPath, relaxedPerms)
+                newPerms = int(oct(os.stat(dirPath).st_mode)[-3:], 8)
+                assert newPerms == relaxedPerms, f"Unable to set perms of {dirPath} to {oct(relaxedPerms)}"
+
+            try:
+                run(['cp', '-a', '-f', cpSrcResPath, cpDstResPath])
+            finally:
+                for dirPath in dirsToModify:
+                    perms = oldPerms[dirPath]
+                    log.debug(f"Changing permissions of {dirPath} back from {oct(relaxedPerms)} to {oct(perms)}:{type(perms)}")
+                    os.chmod(dirPath, perms)
+                    # verify it's right
+                    assert int(oct(os.stat(dirPath).st_mode)[-3:], 8) == perms, "Unable to revert permissions"
 
 
 def applyOverlay(img, overlay):
@@ -622,6 +754,8 @@ def applyOverlay(img, overlay):
 
 
 _toolVersions = None
+
+
 def getToolVersions():
     """Detect version information for the currently enabled toolchain."""
 
@@ -633,7 +767,8 @@ def getToolVersions():
         LINUX_VERSION_CODE
         """
         linuxHeaderVer = sp.run(['riscv64-unknown-linux-gnu-gcc', '-E', '-xc', '-'],
-                  input=linuxHeaderTest, stdout=sp.PIPE, universal_newlines=True)
+                                input=linuxHeaderTest,
+                                stdout=sp.PIPE, universal_newlines=True)
         linuxHeaderVer = linuxHeaderVer.stdout.splitlines()[-1].strip()
 
         # Major/minor version of the linux kernel headers included with our
@@ -643,18 +778,21 @@ def getToolVersions():
         linuxMin = str((int(linuxHeaderVer) >> 8) & 0xFF)
 
         # Toolchain major version
-        toolVerStr = sp.run(["riscv64-unknown-linux-gnu-gcc", "--version"],
-                universal_newlines=True, stdout=sp.PIPE).stdout
-        toolVer = toolVerStr[36]
+        toolVerStr = sp.run(["riscv64-unknown-linux-gnu-gcc", "-dumpfullversion"],
+                            universal_newlines=True, stdout=sp.PIPE).stdout
+        toolVer = toolVerStr.split('.')[0]
 
-        _toolVersions = {'linuxMaj' : linuxMaj,
-                'linuxMin' : linuxMin,
-                'gcc' : toolVer}
+        _toolVersions = {'linuxMaj': linuxMaj,
+                         'linuxMin': linuxMin,
+                         'gcc': toolVer}
 
     return _toolVersions
 
+
 # only warn once per-submodule (if it's included by multiple workloads)
 checkGitStatusWarned = []
+
+
 def checkGitStatus(submodule):
     """Returns a dictionary representing the status of a git repo.
 
@@ -668,19 +806,19 @@ def checkGitStatus(submodule):
     'rebuild' : A random number if the repo should be considered not up to date
         for any reason (e.g. dirty==True or init==False). 0 otherwised.
 
-    This is primarily useful as an input to doit's config_changed() updtodate
+    This is primarily useful as an input to doit's config_changed() uptodate
     helper which considers a workload not uptodate if some string or dictionary
     has changed since the last time it ran. The 'sha' or 'rebuild' fields will
     change if the repo has changed (or we can't tell if it's changed)."""
 
     log = logging.getLogger()
 
-    if submodule == None:
+    if submodule is None:
         return {
-                'sha' : "",
-                'dirty' : False,
-                "init" : False,
-                "rebuild" : ""
+                'sha': "",
+                'dirty': False,
+                "init": False,
+                "rebuild": "",
                 }
 
     try:
@@ -688,16 +826,16 @@ def checkGitStatus(submodule):
     except (git.InvalidGitRepositoryError, git.exc.NoSuchPathError):
         # Submodule not initialized (or otherwise can't be read as a repo)
         return {
-                'sha' : "",
-                'dirty' : True,
-                "init" : False,
-                "rebuild" : random.random()
+                'sha': "",
+                'dirty': True,
+                "init": False,
+                "rebuild": random.random(),
                 }
 
     status = {
-            'init' : True,
-            'sha' : repo.head.object.hexsha,
-            'dirty' : repo.is_dirty()
+            'sha': repo.head.object.hexsha,
+            'dirty': repo.is_dirty(),
+            'init': True,
             }
     if repo.is_dirty():
         # In the absense of a clever way to record changes, we must assume that
@@ -769,6 +907,7 @@ class WithMetadataChecker(doit.dependency.MD5Checker):
 
             return md5State + stat
 
+
 # The doit.tools.config_changed helper has a few limitations:
 #   - doesn't support multiple invocations in a single uptodate.
 #   - It is not JSON serializable which means you can't use it as a calc_dep
@@ -806,7 +945,7 @@ class config_changed(dict):
         task._config_changed_lastID += 1
 
         configKey = '_config_changed'+self.saverID
-        task.value_savers.append(lambda: {configKey:self.config_digest})
+        task.value_savers.append(lambda: {configKey: self.config_digest})
 
     def __call__(self, task, values):
         """return True if config values are UNCHANGED"""
@@ -819,9 +958,10 @@ class config_changed(dict):
             return False
         return (last_success == self.config_digest)
 
+
 def appendPath(basepath, appendval):
     return basepath.parent / (basepath.name + appendval)
 
+
 def noDiskPath(path):
     return appendPath(path, '-nodisk')
-

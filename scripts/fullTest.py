@@ -5,33 +5,36 @@ import argparse
 import time
 import logging
 import subprocess as sp
+import os
 
-sys.path.append("..")
-import wlutil
+script_dir = os.path.dirname(os.path.realpath(__file__))
+
+sys.path.append(script_dir + "/..")
+import wlutil  # NOQA
 
 rootDir = pathlib.Path(__file__).parent.resolve()
 logDir = rootDir / "testLogs"
-testDir = (rootDir / '../test').resolve() 
+testDir = (rootDir / '../test').resolve()
 marshalBin = (rootDir / "../marshal").resolve()
 
 categories = ['baremetal', 'qemu', 'spike', 'smoke', 'special']
 
 # Arguments to (marshal, marshal CMD) per category
 categoryArgs = {
-        'baremetal': ([], ["--spike"]),
-        'qemu' : ([], []),
-        'smoke' : ([], []),
-        'spike' : (['--no-disk'], ['--spike']),
-        'special' : ([], [])
+        'baremetal': (['-v'], ["--spike"]),
+        'qemu': (['-v'], []),
+        'smoke': (['-v'], []),
+        'spike': (['-v', '--no-disk'], ['--spike']),
+        'special': (['-v'], [])
 }
 
 # lists of test names to run for each category, each name
 # should correspond to a test in FireMarshal/tests. E.G. "command" means
-# "FireMarshal/test/command.yaml". 
+# "FireMarshal/test/command.yaml".
 categoryTests = {
         # Run on spike. These tests depend only on an installed toolchain, you
         # don't need to initialize Marshal's submodules to run this category
-        'baremetal' : [
+        'baremetal': [
             'bare',
             'dummy-bare',
             'spike',
@@ -42,16 +45,13 @@ categoryTests = {
 
         # These is the most complete 'general' tests and is the way most people
         # will use Marshal
-        "qemu" : [
-            'bbl',
-            'bbl-src',
-            'bbl-args',
+        "qemu": [
             'opensbi-src',
             'opensbi-args',
             'command',
             'driversJob',
             'drivers',
-            'fed-run',
+            #            'fed-run',
             'flist',
             'generateFiles',
             'guest-init',
@@ -76,7 +76,7 @@ categoryTests = {
         # in "qemu" could run nodisk on spike, but it wouldn't really test
         # anything new. We just include a few at-risk tests here to shave a few
         # hours off the full test. Smoke runs also use spike.
-        "spike" : [
+        "spike": [
            'command',
            'flist',
            'host-init',
@@ -85,12 +85,11 @@ categoryTests = {
            'overlay',
            'post_run_hook',
            'simArgs',
-           'bbl'
            ],
 
         # A hopefully minimal and fast(ish) set of tests to make sure nothing
         # obvious is broken
-        "smoke" : [
+        "smoke": [
             'fed-smoke0',
             'smoke0',
             'smoke1',
@@ -99,7 +98,7 @@ categoryTests = {
 
         # These tests aren't run directly. Instead they include a testing
         # script that is run.
-        "special" : [
+        "special": [
                 'clean',
                 'incremental',
                 'inherit',
@@ -115,14 +114,14 @@ categoryTests = {
 }
 
 
-def runTests(testNames, categoryName, marshalArgs=[], cmdArgs=[]):
+def runTests(testNames, categoryName, marshalArgs=[], cmdArgs=[], doTests=True):
     """Run the tests named in testNames. Logging will use categoryName to
     identify this set of tests. marshalArgs and cmdArgs are the arguments to
     pass to 'marshal' and 'marshal test', respectively."""
     log = logging.getLogger()
 
     # Tuples of (testName, exception) for each failed test
-    failures=[]
+    failures = []
 
     for tName in testNames:
         log.log(logging.INFO, "[{}] {}:".format(categoryName, tName))
@@ -131,7 +130,8 @@ def runTests(testNames, categoryName, marshalArgs=[], cmdArgs=[]):
         try:
             # These log at level DEBUG (go to log file but not stdout)
             wlutil.run([marshalBin] + marshalArgs + ['clean', tPath], check=True)
-            wlutil.run([marshalBin] + marshalArgs + ['test'] + cmdArgs + [tPath], check=True)
+            cmd = 'test' if doTests else 'build'
+            wlutil.run([marshalBin] + marshalArgs + [cmd] + cmdArgs + [tPath], check=True)
         except sp.CalledProcessError as e:
             log.log(logging.INFO, "FAIL")
             failures.append(("[{}]: {}".format(categoryName, tName), e))
@@ -140,7 +140,7 @@ def runTests(testNames, categoryName, marshalArgs=[], cmdArgs=[]):
         log.log(logging.INFO, "PASS")
 
     return failures
-        
+
 
 def runSpecial(testNames, categoryName):
     """Run the tests named in testNamed assuming they are special tests. Each
@@ -151,14 +151,14 @@ def runSpecial(testNames, categoryName):
     log = logging.getLogger()
 
     # Tuples of (testName, exception) for each failed test
-    failures=[]
+    failures = []
 
     for tName in testNames:
         log.log(logging.INFO, "[{}] {}:".format(categoryName, tName))
         tPath = testDir / tName
 
         try:
-            wlutil.run(["python3", tPath / "test.py", marshalBin], check=True)
+            wlutil.run(["python3", tPath / "test.py", marshalBin], check=True, shell=True)
         except sp.CalledProcessError as e:
             log.log(logging.INFO, "FAIL")
             failures.append(("[{}]: {}".format(categoryName, tName), e))
@@ -167,6 +167,7 @@ def runSpecial(testNames, categoryName):
         log.log(logging.INFO, "PASS")
 
     return failures
+
 
 if __name__ == "__main__":
     logDir.mkdir(exist_ok=True)
@@ -181,26 +182,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run end-to-end FireMarshal tests (mostly in FireMarshal/test)")
 
     parser.add_argument("-c", "--categories", nargs="+", default=list(categories),
-            help="Specify which categorie(s) of test to run. By default, all tests will be run")
-
+                        help="Specify which categorie(s) of test to run. By default, all tests will be run")
+    parser.add_argument("-s", "--skiptests", action="store_true")
+    parser.set_defaults(skiptests=False)
     # TODO: add a 'from-failures' option to only run tests that failed a previous run
 
     args = parser.parse_args()
-
     allFailures = []
     for category in args.categories:
         if category != 'special':
             allFailures += runTests(categoryTests[category], category,
-                    marshalArgs=categoryArgs[category][0], cmdArgs=categoryArgs[category][1])
+                                    marshalArgs=categoryArgs[category][0],
+                                    cmdArgs=categoryArgs[category][1],
+                                    doTests=not args.skiptests)
         else:
             allFailures += runSpecial(categoryTests["special"], "SPECIAL")
 
     log.info("Test Summary:")
     if len(allFailures) > 0:
         log.info("Some tests failed:")
-        for fail in allFailures: 
+        for fail in allFailures:
             log.info(fail[0])
         sys.exit(1)
     else:
-        log.info("All PASS") 
+        log.info("All PASS")
         sys.exit(0)

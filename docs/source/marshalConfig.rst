@@ -70,11 +70,6 @@ your workload configuration directly (see :ref:`workload-linux-src`).
 ^^^^^^^^^^^^^^^^^^^
 Location of the firesim repository to use for the :ref:`command-install` command.
 
-``pk-dir``
-^^^^^^^^^^^^^^^^^
-Default proxy-kernel source directory. The RISC-V proxy kernel repository
-provides code for the Berkeley Boot Loader ('bbl').
-
 ``log-dir``
 ^^^^^^^^^^^^^^^^^^^
 Default directory to use when writing logs from FireMarshal runs.
@@ -89,7 +84,8 @@ uartlog or output files).
 FireMarshal calls into makefiles for several of its dependencies. This option
 provides the default level of parallelism to use when calling into these
 makefiles. The value here will be append to the '-j' option (e.g. jlevel='16' →
-'-j16'). The empty string results in maximum parallelism.
+'-j16'). Setting to null (the default) will autodetect the number of cores
+available on your system and use that.
 
 .. _config-rootfs-size:
 

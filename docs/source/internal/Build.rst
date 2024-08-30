@@ -4,10 +4,12 @@ Build Process
 
 The goal of building a workload is to produce a working boot binary and
 (optionally) a root filesystem to boot from. The same outputs are used for
-Spike, Qemu, and FireSim. The one exception is that Spike does not support a
-disk, so users may choose to create an initramfs-only version of their workload
-for Spike (that binary will boot on Qemu and FireSim as well). The build process
-proceeds as follows:
+Spike, Qemu, and FireSim. Spike now supports a disk. In order to use a disk,
+``libspikedevices.so`` should be installed by Chipyard to the ``RISCV`` library path (i.e. ``$RISCV/lib``)).
+The Iceblk block device model will be used as the default block device model. Users may also choose to create 
+an initramfs-only version of their workload instead for Spike
+(that binary will boot on Qemu and FireSim as well).
+The build process proceeds as follows:
 
 Build Parents
 --------------------
@@ -92,8 +94,8 @@ Linux Kernel Generation and Linking
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 With all of the dependencies finished, we can finally compile the Linux kernel
 and link it with the bootloader. While each workload can use a custom kernel
-source, all workloads use the same bootloader (for now), located at
-``riscv-pk/``. The final linked bbl+linux+initramfs is coppied into
+source, all workloads use the same bootloader.
+The final linked sbi+linux+initramfs is coppied into
 ``images/workloadName-bin``.
 
 Build Rootfs

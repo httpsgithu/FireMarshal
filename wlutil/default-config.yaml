@@ -8,17 +8,14 @@ board-dir : '../boards/firechip'
 # Stores all outputs (binaries and images)
 image-dir : '../images'
 
-# Default linux source
-# linux-dir : '../riscv-linux'
-#
-# # Default pk source
-# pk-dir : '../boards/default/firmware/opensbi'
-
 # Runtime Logs
 log-dir : '../logs' 
 
 # SW-simulation outputs
 res-dir : '../runOutput'
+
+# mount working directory
+mount-dir : "../disk-mount"
 
 # Location of the FireSim repository. Used by the 'install' command. Null
 # indicates that no FireSim installation is available.
@@ -26,7 +23,7 @@ firesim-dir : null
 
 # Default parallelism level to use in subcommands (mostly when calling 'make')
 # '' means unbounded
-jlevel : ''
+jlevel : null
 
 # Number of extra bytes to leave free by default in filesystem images
 rootfs-margin : '256MiB'
